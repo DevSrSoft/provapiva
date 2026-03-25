@@ -22,9 +22,9 @@ import json
 import os
 import re
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from google import genai
 from google.genai import types
 
@@ -65,6 +65,21 @@ class CompanyInfoExtra(CompanyInfo):
     forma_giuridica: Optional[str] = None
     codice_sdi: Optional[str] = None
     ai_source: Optional[str] = None
+    ai_note: Optional[str] = None
+
+
+class CompanySuggestion(BaseModel):
+    ragione_sociale: str
+    partita_iva: Optional[str] = None
+    sede: Optional[str] = None
+    forma_giuridica: Optional[str] = None
+    attivita: Optional[str] = None
+
+
+class SearchResult(BaseModel):
+    query: str
+    risultati: List[CompanySuggestion]
+    ai_source: str
     ai_note: Optional[str] = None
 
 
@@ -275,6 +290,68 @@ def _empty_result(note: str) -> dict:
     }
 
 
+# ─── Ricerca per ragione sociale ────────────────────────────────────────────
+
+async def search_company_by_name(query: str) -> dict:
+    """Cerca aziende italiane per ragione sociale tramite Gemini + Google Search."""
+    prompt = f"""Cerca aziende italiane con ragione sociale simile a "{query}".
+
+Cerca sul web (registroimprese.it, dnb.com, europages.it, kompass.com, tuttitalia.it, informazione-aziende.it, paginegialle.it) e restituisci le aziende trovate.
+
+Restituisci SOLO un JSON valido con una lista di risultati, niente altro testo:
+{{
+    "risultati": [
+        {{
+            "ragione_sociale": "NOME COMPLETO AZIENDA",
+            "partita_iva": "12345678901 oppure null",
+            "sede": "città e provincia (es. Milano MI)",
+            "forma_giuridica": "SRL, SPA, ecc. oppure null",
+            "attivita": "breve descrizione attività oppure null"
+        }}
+    ]
+}}
+
+REGOLE:
+- Restituisci massimo 10 risultati
+- SOLO JSON valido, niente altro testo
+- La partita IVA deve essere di 11 cifre se la trovi, altrimenti null
+- NON inventare dati — solo aziende reali trovate sul web
+- Ordina per rilevanza rispetto alla ricerca "{query}"
+"""
+
+    try:
+        result_text = _gemini_search(prompt)
+        if not result_text:
+            return {"query": query, "risultati": [], "ai_source": None, "ai_note": "Nessuna risposta da Gemini"}
+
+        result_text = result_text.strip()
+        if result_text.startswith("```"):
+            result_text = re.sub(r"^```\w*\n?", "", result_text)
+            result_text = re.sub(r"\n?```$", "", result_text)
+        result_text = result_text.strip()
+
+        data = json.loads(result_text)
+        risultati = data.get("risultati", [])
+
+        # Valida le P.IVA
+        for r in risultati:
+            piva = r.get("partita_iva")
+            if piva and not re.fullmatch(r"\d{11}", str(piva).strip()):
+                r["partita_iva"] = None
+
+        return {
+            "query": query,
+            "risultati": risultati,
+            "ai_source": "Gemini 2.5 Flash + Google Search",
+            "ai_note": None,
+        }
+
+    except json.JSONDecodeError:
+        return {"query": query, "risultati": [], "ai_source": None, "ai_note": f"Risposta non parsabile: {result_text[:200]}"}
+    except Exception as e:
+        return {"query": query, "risultati": [], "ai_source": None, "ai_note": f"Errore Gemini: {str(e)}"}
+
+
 # ─── Endpoint ────────────────────────────────────────────────────────────────
 
 @app.get("/company/{partita_iva}", response_model=CompanyInfo, tags=["Company"])
@@ -317,6 +394,21 @@ async def get_company_extra(partita_iva: str):
     extra = await search_company_data(piva, base.get("company_name"))
 
     return CompanyInfoExtra(**base, **extra)
+
+
+@app.get("/search", response_model=SearchResult, tags=["Search"])
+async def search_companies(q: str = Query(..., min_length=2, description="Ragione sociale da cercare")):
+    """
+    Cerca aziende italiane per ragione sociale.
+    Restituisce suggerimenti con P.IVA, sede e attività.
+
+    Esempio: /search?q=salerno+ponteggi
+    """
+    if not os.getenv("GEMINI_API_KEY"):
+        raise HTTPException(500, "GEMINI_API_KEY non configurata.")
+
+    result = await search_company_by_name(q)
+    return SearchResult(**result)
 
 
 @app.get("/health", tags=["System"])
